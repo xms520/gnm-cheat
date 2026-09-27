@@ -60,67 +60,143 @@ static void gnm_sync_flags(void) {
     }
 }
 
-// 读取 JS 探针（gnm_probe.txt），拿到真实 cachePath（供日志/配置落盘）
-static void gnm_scan_probe(void) {
-    if (g_probeSeen) { return; }
-    NSMutableArray *dirs = [NSMutableArray arrayWithObject:
-        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]];
-    for (NSString *d in dirs) {
-        NSString *p = [d stringByAppendingPathComponent:@"gnm_probe.txt"];
-        NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
-        if (!s) { continue; }
-        for (NSString *line in [s componentsSeparatedByString:@"\n"]) {
-            if ([line hasPrefix:@"cachePath="]) {
-                NSString *cp = [line substringFromIndex:10];
-                if (cp.length) { g_jsCachePath = cp; mlog(@"js probe cachePath=%@", cp); }
+// 读取 JS 探针（gnm_probe.txt / gnm_js.log），并回灌到 native 日志
+//   v2：JS 侧写入的目录不可预知 → 用 -[conchRuntime getRootCachePath] 反查 + 多候选目录扫描
+static NSString *g_jsLogCache = nil;
+static NSString *g_lastJsLog = nil;
+
+static NSArray *gnm_probe_dirs(void);
+
+static NSArray *gnm_probe_dirs(void) {
+    NSMutableArray *a = [NSMutableArray array];
+    NSString *home = NSHomeDirectory();
+    [a addObject:[home stringByAppendingPathComponent:@"Documents"]];
+    if (g_jsLogCache) {
+        [a addObject:g_jsLogCache];
+        [a addObject:[g_jsLogCache stringByAppendingPathComponent:@"stand.alone.version"]];
+        [a addObject:[g_jsLogCache stringByAppendingPathComponent:@"appCache/stand.alone.version"]];
+    }
+    // conchRuntime.getRootCachePath() → .../Library/Caches/LayaCache/appCache
+    Class cc = NSClassFromString(@"conchRuntime");
+    if (cc) {
+        id inst = nil;
+        SEL gs = @selector(GetIOSConchRuntime);
+        if ([cc respondsToSelector:gs]) { inst = ((id (*)(id, SEL))objc_msgSend)(cc, gs); }
+        SEL rg = @selector(getRootCachePath);
+        if (inst && [inst respondsToSelector:rg]) {
+            NSString *rp = ((id (*)(id, SEL))objc_msgSend)(inst, rg);
+            if (rp.length) {
+                [a addObject:rp];
+                [a addObject:[rp stringByAppendingPathComponent:@"stand.alone.version"]];
+                // .../Library/Caches/LayaCache/appCache → 上两级 + Documents
+                [a addObject:[[rp stringByDeletingLastPathComponent] stringByDeletingLastPathComponent]];
+                mlog(@"getRootCachePath=%@", rp);
             }
         }
-        g_probeSeen = YES;
-        gnm_sync_flags();
-        return;
+    }
+    [a addObject:@"/tmp"];
+    [a addObject:home];
+    return a;
+}
+
+static void gnm_scan_probe(void) {
+    NSArray *dirs = gnm_probe_dirs();
+    // 1) 探针
+    if (!g_probeSeen) {
+        for (NSString *d in dirs) {
+            NSString *p = [d stringByAppendingPathComponent:@"gnm_probe.txt"];
+            NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            if (!s) { continue; }
+            mlog(@"probe found at %@", p);
+            for (NSString *line in [s componentsSeparatedByString:@"\n"]) {
+                if ([line hasPrefix:@"cachePath="]) {
+                    NSString *cp = [line substringFromIndex:10];
+                    if (cp.length) { g_jsCachePath = cp; g_jsLogCache = cp; }
+                }
+                mlog(@"  probe| %@", line);
+            }
+            g_probeSeen = YES;
+            gnm_sync_flags();
+            break;
+        }
+    }
+    // 2) JS 日志回灌（每 2s 一次，读到多少写多少）
+    for (NSString *d in dirs) {
+        NSString *p = [d stringByAppendingPathComponent:@"gnm_js.log"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            g_jsLogCache = d;
+            NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            if (s.length && ![s isEqualToString:g_lastJsLog]) {
+                g_lastJsLog = s;
+                mlog(@"=== JS LOG (%@) ===", p);
+                for (NSString *ln in [s componentsSeparatedByString:@"\n"]) {
+                    if (ln.length) { mlog(@"  JS| %@", ln); }
+                }
+                mlog(@"=== JS LOG END ===");
+            }
+            break;
+        }
     }
 }
 
 #pragma mark - JS 源码（由 gen.py 注入，JSON/ObjC 双重转义已校验）
 static NSString *const kBootJS =
-    @"/*\n * boot.js —— 在 LayaNative Conch 全局上下文中执行（由 dylib 经 [conchRuntime runJS:] 注入）\n * 职责：\n *   1) 建立日志/探针文件通道（写 conch.getCachePath()）\n *   2) wrap window.loadLib —— 当加载 js/bundle.js 时读出源码，在 IIFE 内部插入 hook 源码后 eval\n *   3) 兜底：若 wrap 失败，记录原因\n */\n(function () {\n    var W = window;\n    if (W.__GNM_BOOT) { return; }\n    W.__GNM_BOOT = true;\n\n    /* ---------------- 日志（内存环形 + 落盘） -----"
-    @"----------- */\n    var LINES = [];\n    function cachePath() {\n        var c = null;\n        try { c = conch.getCachePath(); } catch (e) { }\n        if (!c) { try { c = conchConfig.getCachePath(); } catch (e) { } }\n        return c;\n    }\n    function writeAll() {\n        var txt = LINES.join('\\u000A');\n        var cps = [];\n        try { var c = cachePath(); if (c) { cps.push(c"
-    @"); } } catch (e) { }\n        cps.push('');                                   /* cwd 相对路径 */\n        var ok = 0;\n        for (var i = 0; i < cps.length; i++) {\n            var p = cps[i] ? (cps[i] + '/gnm_js.log') : 'gnm_js.log';\n            try { fs_writeFileSync(p, txt); ok++; } catch (e) { }\n        }\n        return ok;\n    }\n    W.__GNM_LOG = function (m) {\n        try {\n   "
-    @"         LINES.push('[' + (new Date()).getTime() + '] ' + m);\n            if (LINES.length > 400) { LINES.splice(0, LINES.length - 400); }\n            writeAll();\n        } catch (e) { }\n    };\n    function L(m) { try { W.__GNM_LOG(m); } catch (e) { } }\n\n    /* ---------------- 探针（把 cache 路径告诉 native） ---------------- */\n    function probe() {\n        try {\n            var c = "
-    @"cachePath() || '';\n            var s = 'cachePath=' + c + '\\u000A' +\n                'exePath=' + (function () { try { return getExePath(); } catch (e) { return '?'; } })() + '\\u000A' +\n                'fs_readFileSync=' + (typeof fs_readFileSync) + '\\u000A' +\n                'fs_writeFileSync=' + (typeof fs_writeFileSync) + '\\u000A' +\n                'readFileSync=' + (typeof "
-    @"readFileSync) + '\\u000A' +\n                'appcache=' + (typeof W.appcache) + '\\u000A' +\n                'conch=' + (typeof conch);\n            var paths = [];\n            if (c) { paths.push(c + '/gnm_probe.txt'); }\n            paths.push('gnm_probe.txt');\n            for (var i = 0; i < paths.length; i++) {\n                try { fs_writeFileSync(paths[i], s); } catch (e) { }"
-    @"\n            }\n            return c;\n        } catch (e) { return ''; }\n    }\n\n    /* ---------------- 读取 DCC 资源 ---------------- */\n    function toStr(buf) {\n        if (buf == null) { return null; }\n        if (typeof buf === 'string') { return buf; }\n        try {\n            var u8 = new Uint8Array(buf);\n            var out = '';\n            for (var i = 0; i < u8.length; i"
-    @" += 8192) {\n                out += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));\n            }\n            return out;\n        } catch (e) { return null; }\n    }\n    function READ(url) {\n        var u = '' + url;\n        var base = u.substring(u.lastIndexOf('/') + 1);\n        var cands = [u, '/' + base, base];\n        var i, s;\n        /* 1) AppCache（native DCC 虚拟路"
-    @"径，最正确） */\n        try {\n            var ac = W.appcache;\n            if (ac && typeof ac.loadCachedURL === 'function') {\n                for (i = 0; i < cands.length; i++) {\n                    s = toStr(ac.loadCachedURL(cands[i]));\n                    if (s && s.length > 10000) { L('read via appcache ' + cands[i]); return s; }\n                }\n            }\n        } catch (e"
-    @") { }\n        /* 2) readFileSync / fs_readFileSync / readFile */\n        var fns = [];\n        try { if (typeof readFileSync === 'function') { fns.push(readFileSync); } } catch (e) { }\n        try { if (typeof fs_readFileSync === 'function') { fns.push(fs_readFileSync); } } catch (e) { }\n        try { if (typeof readFile === 'function') { fns.push(readFile); } } catch (e) { }\n "
-    @"       for (var k = 0; k < fns.length; k++) {\n            for (i = 0; i < cands.length; i++) {\n                try {\n                    s = k === 0 ? toStr(fns[k](cands[i], 'utf8')) : toStr(fns[k](cands[i]));\n                    if (s && s.length > 10000) { L('read via fn#' + k + ' ' + cands[i]); return s; }\n                } catch (e) { }\n            }\n        }\n        retur"
-    @"n null;\n    }\n\n    /* ---------------- wrap loadLib ---------------- */\n    function install() {\n        var _loadLib = W.loadLib;\n        if (typeof _loadLib !== 'function') { return false; }\n        if (W.__GNM_LIBW) { return true; }\n        W.__GNM_LIBW = true;\n        W.loadLib = function (url) {\n            try {\n                if (url && ('' + url).indexOf('bundle.js') >"
-    @"= 0) {\n                    var src = READ(url);\n                    if (src && src.length > 100000) {\n                        var idx = src.lastIndexOf('}());');\n                        if (idx < 0) { idx = src.length; }\n                        var out = src.substring(0, idx) + '\\u000A' + W.__GNM_HOOK_SRC + '\\u000A' + src.substring(idx);\n                        L('bundle instru"
-    @"mented len=' + src.length);\n                        W.eval(out + '\\u000A//@ sourceURL=' + url);\n                        return;\n                    }\n                    L('bundle read FAILED url=' + url);\n                }\n            } catch (e) {\n                L('loadLib wrap err ' + e);\n            }\n            return _loadLib.apply(this, arguments);\n        };\n        L"
-    @"('loadLib wrapped');\n        return true;\n    }\n\n    var cp = probe();\n    L('boot v1 cachePath=' + cp);\n    if (!install()) {\n        L('loadLib missing -> retry');\n        var n = 0;\n        var t = setInterval(function () {\n            n++;\n            if (install() || n > 60) { clearInterval(t); if (n > 60) { L('loadLib never appeared'); } }\n        }, 100);\n    }\n\n    /* 定"
-    @"时刷新探针（cachePath 可能晚一点才可用） */\n    setInterval(function () { probe(); writeAll(); }, 5000);\n})();\n";
+    @"/*\n * boot.js  -- injected via [conchRuntime runJS:] (LayaAir Conch)\n * Goal: obtain js/bundle.js source, splice hook.js inside the IIFE, evaluate.\n * All strings are ASCII to avoid any encoding hazard across runJS.\n */\n(function () {\n    'use strict';\n\n    /* ---- resolve global object (runJS eval ctx may lack `window`) ---- */\n    var G = null;\n    try { if (typeof window !=="
+    @" 'undefined' && window) { G = window; } } catch (e) { }\n    if (!G) { try { if (typeof globalThis !== 'undefined' && globalThis) { G = globalThis; } } catch (e) { } }\n    if (!G) { try { if (typeof self !== 'undefined' && self) { G = self; } } catch (e) { } }\n    if (!G) { try { if (typeof global !== 'undefined' && global) { G = global; } } catch (e) { } }\n    if (!G) { return;"
+    @" }\n    if (G.__GNM_BOOT) { return; }\n    G.__GNM_BOOT = true;\n    G.__GNM_BOOT_V = 2;\n\n    /* ---- cache path ---- */\n    var CP = '';\n    try { if (typeof conch !== 'undefined' && conch.getCachePath) { CP = '' + conch.getCachePath(); } } catch (e) { }\n    if (!CP) { try { CP = '' + conchConfig.getCachePath(); } catch (e) { } }\n    G.__GNM_CACHE = CP;\n\n    function paths(name) "
+    @"{\n        var out = [], seen = {};\n        function add(p) { if (p && !seen[p]) { seen[p] = 1; out.push(p); } }\n        if (CP) {\n            add(CP + '/' + name);\n            add(CP + '/LayaCache/appCache/' + name);\n        }\n        add(name);\n        add('/tmp/' + name);\n        add('/var/mobile/Documents/' + name);\n        return out;\n    }\n    function writeFile(name, text"
+    @") {\n        var ps = paths(name), fns = [], i, j, ok = 0;\n        try { if (typeof fs_writeFileSync === 'function') { fns.push(fs_writeFileSync); } } catch (e) { }\n        try { if (typeof writeFile === 'function') { fns.push(writeFile); } } catch (e) { }\n        try { if (typeof writeFileSync === 'function') { fns.push(writeFileSync); } } catch (e) { }\n        for (i = 0; i < "
+    @"ps.length; i++) {\n            for (j = 0; j < fns.length; j++) {\n                try { fns[j](ps[i], text); ok++; break; } catch (e) { }\n            }\n        }\n        return ok;\n    }\n\n    /* ---- log ring + flush ---- */\n    var LINES = [];\n    G.__GNM_LOG = function (m) {\n        try {\n            LINES.push('[' + Date.now() + '] ' + m);\n            if (LINES.length > 500) "
+    @"{ LINES.splice(0, LINES.length - 500); }\n            writeFile('gnm_js.log', LINES.join('\\n'));\n        } catch (e) { }\n    };\n    function L(m) { try { G.__GNM_LOG('[boot] ' + m); } catch (e) { } }\n\n    /* ---- probe: report env back to native ---- */\n    function probe(extra) {\n        var s = [\n            'v=2',\n            'alive=' + (G.__GNM_ALIVE || 0),\n            'cach"
+    @"ePath=' + CP,\n            'fs_write=' + (typeof fs_writeFileSync),\n            'fs_read=' + (typeof fs_readFileSync),\n            'readFileSync=' + (typeof readFileSync),\n            'loadLib=' + (typeof G.loadLib),\n            'appcache=' + (typeof G.appcache),\n            'conch=' + (typeof conch),\n            'bundle=' + (G.__GNM_BUNDLE_LEN || 0),\n            'extra=' + (ext"
+    @"ra || '')\n        ].join('\\n');\n        writeFile('gnm_probe.txt', s);\n        return s;\n    }\n    probe('boot start');\n    try { if (typeof conch !== 'undefined' && conch.log) { conch.log('GNM boot v2 cp=' + CP); } } catch (e) { }\n\n    /* ---- read helpers ---- */\n    function toStr(buf) {\n        if (buf == null) { return null; }\n        if (typeof buf === 'string') { return "
+    @"buf; }\n        try {\n            var u8 = new Uint8Array(buf);\n            if (u8.length < 100) { return null; }\n            var out = '';\n            for (var i = 0; i < u8.length; i += 8192) {\n                out += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));\n            }\n            return out;\n        } catch (e) { return null; }\n    }\n    var CRC_T = (funct"
+    @"ion () {\n        var t = [], c, n, k;\n        for (n = 0; n < 256; n++) {\n            c = n;\n            for (k = 0; k < 8; k++) { c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }\n            t[n] = c >>> 0;\n        }\n        return t;\n    })();\n    function crc32(str) {\n        var c = 0xFFFFFFFF;\n        for (var i = 0; i < str.length; i++) { c = CRC_T[(c ^ str.charCodeA"
+    @"t(i)) & 0xFF] ^ (c >>> 8); }\n        return ((c ^ 0xFFFFFFFF) >>> 0);\n    }\n    function hex8(n) { var s = (n >>> 0).toString(16); while (s.length < 8) { s = '0' + s; } return s; }\n    function readRaw(path) {\n        var fns = [];\n        try { if (typeof fs_readFileSync === 'function') { fns.push(fs_readFileSync); } } catch (e) { }\n        try { if (typeof readFileSync === 'f"
+    @"unction') { fns.push(readFileSync); } } catch (e) { }\n        try { if (typeof readFile === 'function') { fns.push(readFile); } } catch (e) { }\n        for (var i = 0; i < fns.length; i++) {\n            for (var k = 0; k < 2; k++) {\n                try {\n                    var s = toStr(k === 0 ? fns[i](path, 'utf8') : fns[i](path));\n                    if (s) { return s; }\n  "
+    @"              } catch (e) { }\n            }\n        }\n        return null;\n    }\n    function dccRoots() {\n        var r = [], seen = {};\n        function add(p) { if (p && !seen[p]) { seen[p] = 1; r.push(p); } }\n        if (CP) {\n            add(CP + '/stand.alone.version');\n            add(CP + '/appCache/stand.alone.version');\n            add(CP + '/LayaCache/appCache/stand."
+    @"alone.version');\n            add(CP + '/../stand.alone.version');\n            add(CP);\n        }\n        add('/var/mobile/Library/Caches/LayaCache/appCache/stand.alone.version');\n        return r;\n    }\n    function READ(url) {\n        var u = '' + url;\n        var base = u.substring(u.lastIndexOf('/') + 1);\n        var cands = [u, '/' + base, base], i, s;\n\n        try {\n      "
+    @"      var ac = G.appcache;\n            if (ac && typeof ac.loadCachedURL === 'function') {\n                for (i = 0; i < cands.length; i++) {\n                    s = toStr(ac.loadCachedURL(cands[i]));\n                    if (s && s.length > 100000) { L('via appcache ' + cands[i]); return s; }\n                }\n            }\n        } catch (e) { L('appcache err ' + e); }\n\n   "
+    @"     for (i = 0; i < cands.length; i++) {\n            s = readRaw(cands[i]);\n            if (s && s.length > 100000) { L('via file ' + cands[i]); return s; }\n        }\n\n        var roots = dccRoots(), fid = hex8(crc32(u));\n        for (i = 0; i < roots.length; i++) {\n            s = readRaw(roots[i] + '/' + fid);\n            if (s && s.length > 100000 && s.indexOf('}());') > 0)"
+    @" { L('via dcc ' + roots[i] + '/' + fid); return s; }\n        }\n\n        try {\n            if (typeof fs_readdirSync === 'function') {\n                for (i = 0; i < roots.length; i++) {\n                    var list = null;\n                    try { list = fs_readdirSync(roots[i]); } catch (e) { }\n                    if (!list) { continue; }\n                    for (var j = 0; "
+    @"j < list.length; j++) {\n                        var nm = '' + list[j];\n                        if (!/^[0-9a-f]{8}$/.test(nm)) { continue; }\n                        var t = readRaw(roots[i] + '/' + nm);\n                        if (t && t.length > 100000 && t.indexOf('}());') > 0) {\n                            L('via dirscan ' + roots[i] + '/' + nm);\n                            r"
+    @"eturn t;\n                        }\n                    }\n                }\n            }\n        } catch (e) { }\n        return null;\n    }\n\n    /* ---- instrument + evaluate ---- */\n    var HOOK = G.__GNM_HOOK_SRC || '';\n    function instrument(src) {\n        if (!src || src.length < 100000) { return null; }\n        var idx = src.lastIndexOf('}());');\n        if (idx < 0) { id"
+    @"x = src.lastIndexOf('})();'); }\n        if (idx < 0) { idx = src.length; }\n        G.__GNM_BUNDLE_LEN = src.length;\n        return src.substring(0, idx) + '\\n' + HOOK + '\\n' + src.substring(idx);\n    }\n    var done = false;\n    function tryBundle(url, tag) {\n        if (done) { return true; }\n        try {\n            var src = READ(url);\n            if (!src) { L('bundle read "
+    @"FAILED (' + tag + ')'); return false; }\n            var out = instrument(src);\n            if (!out) { return false; }\n            done = true;\n            probe('instrumented len=' + src.length + ' tag=' + tag);\n            try { G.eval(out + '\\n//@ sourceURL=' + url); }\n            catch (e1) {\n                L('G.eval err ' + e1);\n                try { (0, eval)(out); } cat"
+    @"ch (e2) { L('indirect eval err ' + e2); }\n            }\n            probe('hook evaluated alive=' + (G.__GNM_ALIVE || 0));\n            return true;\n        } catch (e) { L('tryBundle err ' + e); return false; }\n    }\n\n    /* ---- three interception paths ---- */\n    function wrapLoadLib() {\n        if (G.__GNM_LIBW) { return true; }\n        var f = G.loadLib;\n        if (typeof"
+    @" f !== 'function') { return false; }\n        G.__GNM_LIBW = true;\n        G.loadLib = function (url) {\n            try {\n                if (url && ('' + url).indexOf('bundle.js') >= 0 && tryBundle(url, 'loadLib')) { return; }\n            } catch (e) { L('loadLib wrap err ' + e); }\n            return f.apply(this, arguments);\n        };\n        L('loadLib wrapped');\n        ret"
+    @"urn true;\n    }\n    function wrapEval() {\n        if (G.__GNM_EVALW) { return true; }\n        var f = G.eval;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_EVALW = true;\n        G.eval = function (code) {\n            try {\n                if (!done && typeof code === 'string' && code.length > 100000 &&\n                    code.indexOf('}());') > 0 && co"
+    @"de.indexOf('__GNM_HOOK_INSTALLED') < 0) {\n                    var out = instrument(code);\n                    if (out) { done = true; probe('instrumented len=' + code.length + ' tag=eval'); return f.call(G, out); }\n                }\n            } catch (e) { L('eval wrap err ' + e); }\n            return f.apply(this, arguments);\n        };\n        L('eval wrapped');\n        ret"
+    @"urn true;\n    }\n    function wrapRequire() {\n        if (G.__GNM_REQW) { return true; }\n        var f = G.require;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_REQW = true;\n        G.require = function (n) {\n            try {\n                if (n && ('' + n).indexOf('bundle.js') >= 0 && tryBundle(n, 'require')) { return; }\n            } catch (e) { }\n"
+    @"            return f.apply(this, arguments);\n        };\n        L('require wrapped');\n        return true;\n    }\n\n    L('wraps loadLib=' + wrapLoadLib() + ' eval=' + wrapEval() + ' require=' + wrapRequire());\n\n    /* ---- retry / fallback ---- */\n    var n = 0;\n    var t = setInterval(function () {\n        n++;\n        if (done) { probe('done'); clearInterval(t); return; }\n    "
+    @"    wrapLoadLib(); wrapEval(); wrapRequire();\n        if (n === 25) { tryBundle('js/bundle.js', 'poll'); }\n        if (n === 60) { tryBundle('/js/bundle.js', 'poll2'); tryBundle('index.js', 'poll3'); }\n        if (n === 120) { probe('giveup loadLib=' + (typeof G.loadLib)); clearInterval(t); }\n    }, 200);\n\n    setInterval(function () { probe(G.__GNM_ALIVE ? 'alive' : 'waiting')"
+    @"; }, 5000);\n\n    L('boot v2 ready hookLen=' + HOOK.length);\n})();\n";
 static NSString *const kHookJSON =
-    @"window.__GNM_HOOK_SRC = \"/*\\n * hook.js —— 注入 js/bundle.js 的 IIFE 内部执行\\n * 可访问 bundle 内 SceneMgr / PropMgr / MainRoleMgr / Role / iOSDeal / SDK / SDK_ORDER / Laya\\n * 开关由 native 经 [conchRuntime runJS:] 推送到 window.__GNM_CFG\\n */\\n(function () {\\n    var W = window;\\n    var CFG = W.__GNM_CFG = W.__GNM_CFG || { esp: 0, bright: 0, ad: 1 };\\n    function log(m) { try { if (W.__GNM_"
-    @"LOG) { W.__GNM_LOG('[hook] ' + m); } } catch (e) { } }\\n    var L = (typeof Laya !== 'undefined' && Laya) ? Laya : W.Laya;\\n    if (!L) { log('Laya missing, hook abort'); return; }\\n    if (W.__GNM_HOOK_INSTALLED) { log('hook re-entered (cfg esp=' + CFG.esp + ' bright=' + CFG.bright + ')'); return; }\\n    W.__GNM_HOOK_INSTALLED = 1;\\n    log('hook v1 enter');\\n\\n    /* ========"
-    @"========= 广告拦截（JS 层，游戏 SDK 分发的唯一入口） ================= */\\n    try {\\n        if (typeof iOSDeal !== 'undefined' && iOSDeal) {\\n            var _video = iOSDeal.prototype.videoChange;\\n            /* 看视频得奖励：不弹广告，但仍走正规回调链发奖（HANDLER_RUN type=true） */\\n            iOSDeal.prototype.videoChange = function (data) {\\n                if (!CFG.ad) { return _video.apply(this, arguments);"
-    @" }\\n                log('reward video skipped -> auto ok');\\n                setTimeout(function () {\\n                    try { SDK.ins_.send(SDK_ORDER.AD_VIDEO_CLOSE, { name: 'iOS', info: 'ok' }); } catch (e) { log('ad cb err ' + e); }\\n                }, 60);\\n            };\\n            var _noop = function () { };\\n            iOSDeal.prototype.insertChange = function (d) "
-    @"{ if (CFG.ad) { log('insert ad blocked'); return; } return Object.getPrototypeOf(this).insertChange; };\\n            iOSDeal.prototype.bannerChange = function (d) { if (CFG.ad) { return; } };\\n            iOSDeal.prototype.impactionChange = function (d) { if (CFG.ad) { return; } };\\n            iOSDeal.prototype.nativeSmallChange = function (d) { if (CFG.ad) { return; } };\\n   "
-    @"         iOSDeal.prototype.changeFoundAward = function (d) { if (CFG.ad) { return; } };\\n            log('iOSDeal ad hooks installed');\\n        } else {\\n            log('iOSDeal not found');\\n        }\\n    } catch (e) { log('ad hook err ' + e); }\\n\\n    /* ================= 3D 节点工具 ================= */\\n    function rend(n) {\\n        if (!n) { return null; }\\n        try { "
-    @"if (n.skinnedMeshRenderer) { return n.skinnedMeshRenderer; } } catch (e) { }\\n        try { if (n.meshRenderer) { return n.meshRenderer; } } catch (e) { }\\n        return null;\\n    }\\n    function setP(o, k, v) { try { o[k] = v; return 1; } catch (e) { return 0; } }\\n    function collect(root, cap) {\\n        var out = [];\\n        if (!root) { return out; }\\n        var st = "
-    @"[root], g = 0;\\n        while (st.length && g++ < (cap || 40000)) {\\n            var c = st.pop();\\n            if (rend(c)) { out.push(c); }\\n            try {\\n                var n = c.numChildren | 0;\\n                for (var i = 0; i < n; i++) { var ch = c.getChildAt(i); if (ch) { st.push(ch); } }\\n            } catch (e) { }\\n        }\\n        return out;\\n    }\\n\\n    "
-    @"/* 全亮：关光照 / 去 lightmap / 白化 */\\n    function brightNode(n) {\\n        var r = rend(n); if (!r) { return; }\\n        var m = null;\\n        try { m = r.sharedMaterial; } catch (e) { }\\n        if (!m) { return; }\\n        try { if (m.albedoColor) { m.albedoColor = new L.Vector4(1, 1, 1, 1); } } catch (e) { }\\n        setP(m, 'enableLighting', false);\\n        setP(r, 'lightmapIn"
-    @"dex', -1);\\n        setP(r, 'lightmapScaleOffset', null);\\n    }\\n\\n    /* 透视：depthTest=ALWAYS + 淡红染色（实例材质，不污染共享材质） */\\n    var C_ESP = null, C_WHITE = null;\\n    function espNode(n, on) {\\n        var r = rend(n); if (!r) { return; }\\n        var m = null;\\n        try { m = r.material; } catch (e) { }\\n        if (!m) { return; }\\n        if (!C_ESP) { C_ESP = new L.Vector4(1"
-    @".0, 0.25, 0.25, 1.0); C_WHITE = new L.Vector4(1, 1, 1, 1); }\\n        if (on) {\\n            setP(m, 'depthTest', 0x0207);   /* DEPTHTEST_ALWAYS */\\n            setP(m, 'depthWrite', false);\\n            setP(m, 'renderQueue', 3000);   /* TRANSPARENT */\\n            try { m.enableLighting = false; } catch (e) { }\\n            try { if (m.albedoColor) { m.albedoColor = C_ESP; } "
-    @"} catch (e) { }\\n        } else {\\n            setP(m, 'depthTest', 0x0201);   /* DEPTHTEST_LESS */\\n            setP(m, 'depthWrite', true);\\n            setP(m, 'renderQueue', 2000);   /* OPAQUE */\\n            try { if (m.albedoColor) { m.albedoColor = C_WHITE; } } catch (e) { }\\n        }\\n    }\\n\\n    /* ================= 状态机 ================= */\\n    var sScene = null, sS"
-    @"ceneNodes = null, sSceneDone = 0;\\n    var sOwner = null, sOwnerNodes = null;\\n    var sPropNodes = null, sPropSig = '';\\n    var sTicks = 0, sLastProp = 0;\\n\\n    function propNodes() {\\n        var out = [];\\n        try {\\n            var vals = PropMgr.Inst.dic_Prop.values;\\n            for (var i = 0; vals && i < vals.length; i++) {\\n                var p = vals[i];\\n     "
-    @"           if (!p || !p.propArr) { continue; }\\n                for (var j = 0; j < p.propArr.length; j++) { if (p.propArr[j]) { out.push(p.propArr[j]); } }\\n            }\\n        } catch (e) { }\\n        return out;\\n    }\\n\\n    function tick() {\\n        sTicks++;\\n        try {\\n            /* --- 场景（全亮） --- */\\n            var sc = null;\\n            try { sc = SceneMgr.I"
-    @"nst.getScene(); } catch (e) { }\\n            if (sc !== sScene) {\\n                sScene = sc; sSceneNodes = sc ? collect(sc) : null; sSceneDone = 0;\\n                log('scene ' + (sc ? ('nodes=' + (sSceneNodes ? sSceneNodes.length : 0)) : 'null'));\\n            }\\n            if (CFG.bright && sSceneNodes && !sSceneDone) {\\n                sSceneDone = 1;\\n                s"
-    @"etP(sScene, 'enableFog', false);\\n                try { sScene.ambientColor = new L.Vector3(1, 1, 1); } catch (e) { }\\n                for (var i = 0; i < sSceneNodes.length; i++) { brightNode(sSceneNodes[i]); }\\n                var cam = null;\\n                try { cam = SceneMgr.Inst.GetCamera(); } catch (e) { }\\n                if (cam) { setP(cam, 'nearPlane', 0.02); setP("
-    @"cam, 'farPlane', 5000); }\\n                log('bright applied n=' + sSceneNodes.length);\\n            }\\n\\n            /* --- 奶奶（透视档 1/2） --- */\\n            var k = null;\\n            try { k = SceneMgr.Inst.GetKbnnScript(); } catch (e) { }\\n            var owner = (k && k.owner) ? k.owner : null;\\n            if (owner !== sOwner) {\\n                sOwner = owner; sOwnerNod"
-    @"es = owner ? collect(owner, 5000) : null;\\n                log('nainai ' + (owner ? ('nodes=' + sOwnerNodes.length) : 'null'));\\n            }\\n            var espN = CFG.esp >= 1 ? 1 : 0;\\n            if (sOwnerNodes) { for (var j = 0; j < sOwnerNodes.length; j++) { espNode(sOwnerNodes[j], !!espN); } }\\n\\n            /* --- 道具（透视档 2） --- */\\n            var espP = CFG.esp >= 2"
-    @" ? 1 : 0;\\n            if (espP && (sTicks - sLastProp > 10 || !sPropNodes)) {\\n                sLastProp = sTicks; sPropNodes = propNodes();\\n            }\\n            if (sPropNodes) { for (var q = 0; q < sPropNodes.length; q++) { espNode(sPropNodes[q], !!espP); } }\\n\\n            if (sTicks % 20 === 0) {\\n                log('tick ' + sTicks + ' esp=' + CFG.esp + ' bright='"
-    @" + CFG.bright + ' ad=' + CFG.ad +\\n                    ' nainai=' + (sOwner ? 'y' : 'n') + ' prop=' + (sPropNodes ? sPropNodes.length : 0));\\n            }\\n        } catch (e) { log('tick err ' + e); }\\n    }\\n\\n    try { setInterval(tick, 500); log('timer installed'); }\\n    catch (e) { log('timer fail ' + e); }\\n    log('hook installed (esp=' + CFG.esp + ' bright=' + CFG.bri"
-    @"ght + ' ad=' + CFG.ad + ')');\\n})();\\n\";";
+    @"window.__GNM_HOOK_SRC = \"/*\\n * hook.js -- spliced into js/bundle.js IIFE (evaluated in global scope by boot.js)\\n * Available: SceneMgr / PropMgr / MainRoleMgr / Role / iOSDeal / SDK / SDK_ORDER / Laya\\n * Switch: G.__GNM_CFG pushed by native via [conchRuntime runJS:]\\n *\\n * Features:\\n *   1) ad skip  2) see-through (depthTest=ALWAYS)  3) draw enemies on screen  4) bright\\n "
+    @"* ASCII-only on purpose: runJS must not carry non-ASCII bytes.\\n */\\n(function () {\\n    'use strict';\\n    var G = null;\\n    try { if (typeof window !== 'undefined' && window) { G = window; } } catch (e) { }\\n    if (!G) { try { G = globalThis; } catch (e) { } }\\n    if (!G) { G = this; }\\n    var CFG = G.__GNM_CFG = G.__GNM_CFG || { esp: 0, bright: 0, ad: 1 };\\n    function "
+    @"LOG(m) { try { if (G.__GNM_LOG) { G.__GNM_LOG('[hook] ' + m); } } catch (e) { } }\\n    var L = (typeof Laya !== 'undefined' && Laya) ? Laya : G.Laya;\\n    if (!L) { LOG('Laya missing abort'); return; }\\n    G.__GNM_HOOK_INSTALLED = 1;\\n    LOG('hook v2 enter');\\n\\n    /* ---------- 1. ad skip (JS layer; native has fallback) ---------- */\\n    try {\\n        if (typeof iOSDeal !"
+    @"== 'undefined' && iOSDeal && iOSDeal.prototype) {\\n            var _video = iOSDeal.prototype.videoChange;\\n            iOSDeal.prototype.videoChange = function () {\\n                if (!CFG.ad) { return _video ? _video.apply(this, arguments) : undefined; }\\n                LOG('reward skipped -> auto ok');\\n                try { SDK.ins_.send(SDK_ORDER.AD_VIDEO_CLOSE, { name:"
+    @" 'iOS', info: 'ok' }); } catch (e) { }\\n            };\\n            iOSDeal.prototype.insertChange = function () { if (CFG.ad) { return; } };\\n            iOSDeal.prototype.bannerChange = function () { if (CFG.ad) { return; } };\\n            iOSDeal.prototype.impactionChange = function () { if (CFG.ad) { return; } };\\n            iOSDeal.prototype.nativeSmallChange = function ("
+    @") { if (CFG.ad) { return; } };\\n            LOG('iOSDeal ad hooks ok');\\n        } else { LOG('iOSDeal missing'); }\\n    } catch (e) { LOG('ad hook err ' + e); }\\n\\n    /* ---------- 2. 3D helpers ---------- */\\n    function rend(n) {\\n        if (!n) { return null; }\\n        try { if (n.skinnedMeshRenderer) { return n.skinnedMeshRenderer; } } catch (e) { }\\n        try { if ("
+    @"n.meshRenderer) { return n.meshRenderer; } } catch (e) { }\\n        return null;\\n    }\\n    function setP(o, k, v) { try { o[k] = v; return 1; } catch (e) { return 0; } }\\n    function collect(root, cap) {\\n        var out = [], st = [], g = 0;\\n        if (!root) { return out; }\\n        st.push(root);\\n        while (st.length && g++ < (cap || 30000)) {\\n            var c = "
+    @"st.pop();\\n            if (rend(c)) { out.push(c); }\\n            try {\\n                var n = c.numChildren | 0;\\n                for (var i = 0; i < n; i++) { var ch = c.getChildAt(i); if (ch) { st.push(ch); } }\\n            } catch (e) { }\\n        }\\n        return out;\\n    }\\n\\n    /* ---------- 3. enemy detection ---------- */\\n    var KEYS = ['nainai', 'kbnn', 'zhizhu"
+    @"', 'wuya', 'ying_er', 'yinger', 'monster', 'enemy'];\\n    function isEnemy(nm) {\\n        if (!nm) { return false; }\\n        var s = ('' + nm).toLowerCase();\\n        for (var i = 0; i < KEYS.length; i++) { if (s.indexOf(KEYS[i]) >= 0) { return true; } }\\n        return false;\\n    }\\n    var sSig = '';\\n    function scanEnemies() {\\n        var sc = null;\\n        try { sc = "
+    @"SceneMgr.Inst.getScene(); } catch (e) { }\\n        if (!sc) { return null; }\\n        var found = [], st = [sc], g = 0;\\n        while (st.length && g++ < 30000) {\\n            var c = st.pop();\\n            try {\\n                if (rend(c) && isEnemy(c.name)) { found.push(c); }\\n                var n = c.numChildren | 0;\\n                for (var i = 0; i < n; i++) { var ch "
+    @"= c.getChildAt(i); if (ch) { st.push(ch); } }\\n            } catch (e) { }\\n        }\\n        try {\\n            var k = SceneMgr.Inst.GetKbnnScript();\\n            if (k && k.owner) { found.push(k.owner); }\\n        } catch (e) { }\\n        return found;\\n    }\\n\\n    /* ---------- 4. see-through ---------- */\\n    var C_ESP = null, C_WHITE = null;\\n    function espNode(n, on"
+    @") {\\n        var r = rend(n); if (!r) { return; }\\n        var m = null;\\n        try { m = r.material; } catch (e) { }\\n        if (!m) { return; }\\n        if (!C_ESP) { C_ESP = new L.Vector4(1.0, 0.15, 0.15, 1.0); C_WHITE = new L.Vector4(1, 1, 1, 1); }\\n        if (on) {\\n            setP(m, 'depthTest', 0x0207);\\n            setP(m, 'depthWrite', false);\\n            setP(m"
+    @", 'renderQueue', 3000);\\n            setP(m, 'cull', 0);\\n            try { if (m.albedoColor) { m.albedoColor = C_ESP; } } catch (e) { }\\n        } else {\\n            setP(m, 'depthTest', 0x0201);\\n            setP(m, 'depthWrite', true);\\n            setP(m, 'renderQueue', 2000);\\n            try { if (m.albedoColor) { m.albedoColor = C_WHITE; } } catch (e) { }\\n        }\\n "
+    @"   }\\n\\n    /* ---------- 5. bright ---------- */\\n    function brightNode(n) {\\n        var r = rend(n); if (!r) { return; }\\n        var m = null;\\n        try { m = r.sharedMaterial; } catch (e) { }\\n        if (!m) { return; }\\n        try { if (m.albedoColor) { m.albedoColor = new L.Vector4(1, 1, 1, 1); } } catch (e) { }\\n        setP(m, 'enableLighting', false);\\n        "
+    @"setP(r, 'lightmapIndex', -1);\\n        setP(r, 'lightmapScaleOffset', null);\\n    }\\n\\n    /* ---------- 6. screen overlay (enemy box) ---------- */\\n    var gSp = null;\\n    function getLayer() {\\n        if (gSp && gSp.parent) { return gSp; }\\n        try {\\n            gSp = new L.Sprite();\\n            gSp.mouseEnabled = false;\\n            gSp.zOrder = 100000;\\n           "
+    @" L.stage.addChild(gSp);\\n            LOG('esp layer added');\\n        } catch (e) { LOG('layer err ' + e); }\\n        return gSp;\\n    }\\n    function drawBoxes(list) {\\n        var sp = getLayer();\\n        if (!sp) { return -1; }\\n        try { sp.graphics.clear(); } catch (e) { }\\n        var cam = null;\\n        try { cam = SceneMgr.Inst.GetCamera(); } catch (e) { }\\n      "
+    @"  if (!cam) { return -2; }\\n        var n = 0;\\n        for (var i = 0; i < list.length; i++) {\\n            var e = list[i], tp;\\n            try {\\n                tp = new L.Vector3();\\n                var t = e.transform.position;\\n                cam.worldToViewportPoint(t, tp);\\n            } catch (err) { continue; }\\n            var x = tp.x, y = tp.y;\\n            if ("
+    @"!isFinite(x) || !isFinite(y)) { continue; }\\n            if (x < -200 || x > 3000 || y < -200 || y > 3000) { continue; }\\n            try {\\n                sp.graphics.drawRect(x - 30, y - 70, 60, 140, null, '#FF3030', 3);\\n                n++;\\n            } catch (err) { }\\n        }\\n        return n;\\n    }\\n\\n    /* ---------- 7. main loop ---------- */\\n    var sScene = "
+    @"null, sSceneNodes = null, sSceneDone = 0, sTicks = 0;\\n\\n    function tick() {\\n        sTicks++;\\n        try {\\n            var sc = null;\\n            try { sc = SceneMgr.Inst.getScene(); } catch (e) { }\\n            if (sc !== sScene) {\\n                sScene = sc; sSceneNodes = sc ? collect(sc) : null; sSceneDone = 0;\\n                LOG('scene nodes=' + (sSceneNodes ? s"
+    @"SceneNodes.length : 0));\\n            }\\n            if (CFG.bright && sSceneNodes && !sSceneDone) {\\n                sSceneDone = 1;\\n                setP(sScene, 'enableFog', false);\\n                try { sScene.ambientColor = new L.Vector3(1, 1, 1); } catch (e) { }\\n                for (var i = 0; i < sSceneNodes.length; i++) { brightNode(sSceneNodes[i]); }\\n               "
+    @" var cm = null;\\n                try { cm = SceneMgr.Inst.GetCamera(); } catch (e) { }\\n                if (cm) { setP(cm, 'nearPlane', 0.02); setP(cm, 'farPlane', 5000); }\\n                LOG('bright applied n=' + sSceneNodes.length);\\n            }\\n\\n            var en = scanEnemies();\\n            if (en) {\\n                var sig = en.length + ':';\\n                for ("
+    @"var q = 0; q < en.length; q++) { sig += (en[q].name || '?') + ','; }\\n                if (sig !== sSig) { sSig = sig; LOG('enemies=' + sig); }\\n                var nd, ii, kk;\\n                if (CFG.esp >= 1) {\\n                    for (ii = 0; ii < en.length; ii++) {\\n                        nd = collect(en[ii], 2000);\\n                        for (kk = 0; kk < nd.length; kk"
+    @"++) { espNode(nd[kk], true); }\\n                    }\\n                    var d = drawBoxes(en);\\n                    if (sTicks % 10 === 0) { LOG('draw=' + d + ' of ' + en.length); }\\n                } else {\\n                    for (ii = 0; ii < en.length; ii++) {\\n                        nd = collect(en[ii], 2000);\\n                        for (kk = 0; kk < nd.length; kk++"
+    @") { espNode(nd[kk], false); }\\n                    }\\n                    if (gSp) { try { gSp.graphics.clear(); } catch (e) { } }\\n                }\\n            }\\n\\n            G.__GNM_ALIVE = 1;\\n            if (sTicks % 20 === 0) {\\n                LOG('tick ' + sTicks + ' esp=' + CFG.esp + ' bright=' + CFG.bright +\\n                    ' ad=' + CFG.ad + ' enemy=' + (en ? "
+    @"en.length : -1));\\n            }\\n        } catch (e) { LOG('tick err ' + e); }\\n    }\\n\\n    try { setInterval(tick, 200); LOG('timer ok'); } catch (e) { LOG('timer fail ' + e); }\\n    tick();\\n    LOG('hook v2 installed esp=' + CFG.esp + ' bright=' + CFG.bright + ' ad=' + CFG.ad);\\n})();\\n\";";
 static NSString *const kAvatarB64 =
     @"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"
     @"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"
@@ -132,12 +208,21 @@ static NSString *const kAvatarB64 =
 static void (*orig_renderFrame)(id, SEL);
 static void (*orig_runJsLoop)(id, SEL);
 static void (*orig_onVsync)(id, SEL, id);
+static void (*orig_onGLReady)(id, SEL, int, int, int);
 static void gnm_on_frame(id self);
+static void gnm_inject(id rt, const char *why);
 
 static void hook_renderFrame(id s, SEL c) { if (orig_renderFrame) { orig_renderFrame(s, c); } gnm_on_frame(s); }
 static void hook_runJsLoop(id s, SEL c)   { if (orig_runJsLoop)   { orig_runJsLoop(s, c);   } gnm_on_frame(s); }
 static void hook_onVsync(id s, SEL c, id o) {
     if (orig_onVsync) { orig_onVsync(s, c, o); }
+    gnm_on_frame(s);
+}
+// onGLReady 是最早的稳定时机（GL 就绪 + JS 引擎已建），优先在此注入
+static void hook_onGLReady(id s, SEL c, int w, int h, int n) {
+    if (orig_onGLReady) { orig_onGLReady(s, c, w, h, n); }
+    mlog(@"onGLReady w=%d h=%d n=%d -> inject", w, h, n);
+    gnm_inject(s, "onGLReady");
     gnm_on_frame(s);
 }
 
@@ -148,34 +233,48 @@ static void gnm_run_js(id rt, NSString *js) {
 }
 
 static void gnm_push_cfg(id rt) {
+    // 兼容 runJS 的 eval 作用域里可能没有 window 的情况
     NSString *js = [NSString stringWithFormat:
-        @"try{window.__GNM_CFG={esp:%d,bright:%d,ad:%d};}catch(e){}", g_esp, g_bright, g_ad];
+        @"try{var G=(typeof window!=='undefined')?window:((typeof globalThis!=='undefined')?globalThis:this);"
+        @"G.__GNM_CFG={esp:%d,bright:%d,ad:%d};}catch(e){}",
+        g_esp, g_bright, g_ad];
     gnm_run_js(rt, js);
 }
 
 static BOOL g_hookDumped = NO;
+static BOOL g_injected = NO;
+
+// 一次性注入：配置 + hook 源码字符串 + bootstrap
+static void gnm_inject(id rt, const char *why) {
+    if (!rt) { return; }
+    g_injected = YES;
+    gnm_push_cfg(rt);
+    gnm_run_js(rt, kHookJSON);
+    gnm_run_js(rt, kBootJS);
+    mlog(@"boot injected (%s) tick=%d hookLen=%lu bootLen=%lu",
+         why, g_frame, (unsigned long)kHookJSON.length, (unsigned long)kBootJS.length);
+}
+
 static void gnm_on_frame(id rt) {
     g_frame++;
-    if (g_frame % 30 == 0) { gnm_push_cfg(rt); }
 
-    if (!g_bootPushed && g_frame >= 15) {
-        g_bootPushed = YES;
+    if (!g_injected && g_frame >= 3) {
         if (!g_hookDumped) {
             Method m = class_getInstanceMethod(object_getClass(rt), @selector(runJS:));
             mlog(@"frame hook alive (tick=%d) runJS: %s", g_frame, m ? "ok" : "MISSING");
             g_hookDumped = YES;
         }
-        gnm_push_cfg(rt);                       // 先放配置
-        gnm_run_js(rt, kHookJSON);              // 注册 hook 源码字符串
-        gnm_run_js(rt, kBootJS);                // 注入 bootstrap（wrap loadLib）
-        mlog(@"boot injected at tick %d", g_frame);
+        gnm_inject(rt, "frame3");
     }
-    if (g_bootPushed && g_frame % 100 == 0) {
+    if (g_injected && g_frame % 30 == 0) { gnm_push_cfg(rt); }
+
+    // 探针/JS 日志：只在注入后前 30s 高频轮询，之后降频
+    if (g_injected && (g_frame < 1800 ? (g_frame % 60 == 0) : (g_frame % 600 == 0))) {
         gnm_scan_probe();
-        if (!g_probeSeen && g_frame < 3000) {   // 探针一直没出现 → 重注入
-            gnm_run_js(rt, kHookJSON);
-            gnm_run_js(rt, kBootJS);
-            mlog(@"boot RE-injected at tick %d", g_frame);
+        // 真·未跑起来才重注入（探针完全没出现 ≠ JS 没执行，需两者都缺）
+        if (!g_probeSeen && g_frame < 1200 && g_frame % 300 == 0) {
+            mlog(@"probe still missing -> re-inject at tick %d", g_frame);
+            gnm_inject(rt, "retry");
         }
     }
 }
@@ -193,6 +292,9 @@ static void gnm_install_frame_hooks(void) {
     m = class_getInstanceMethod(c, @selector(onVsync:));
     if (m) { orig_onVsync = (void (*)(id, SEL, id))method_getImplementation(m);
              method_setImplementation(m, (IMP)hook_onVsync); mlog(@"hooked onVsync:"); }
+    m = class_getInstanceMethod(c, @selector(onGLReady:height:downloadThreadNum:));
+    if (m) { orig_onGLReady = (void (*)(id, SEL, int, int, int))method_getImplementation(m);
+             method_setImplementation(m, (IMP)hook_onGLReady); mlog(@"hooked onGLReady"); }
 }
 
 #pragma mark - 广告：native 侧短路
