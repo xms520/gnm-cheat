@@ -22,6 +22,7 @@
 #import <unistd.h>
 #import <stdio.h>
 #import <string.h>
+#import "fishhook.h"
 
 #pragma mark - 日志
 static FILE *g_log = NULL;
@@ -99,6 +100,27 @@ static NSArray *gnm_probe_dirs(void) {
     return a;
 }
 
+// 读取缓存目录下所有文件的【大小】，用于确认 DCC 资源位置（不解码，只探测）
+static void gnm_probe_dcc(const char *why) {
+    NSArray *dirs = gnm_probe_dirs();
+    for (NSString *d in dirs) {
+        for (NSString *sub in @[@"", @"stand.alone.version", @"appCache", @"LayaCache"]) {
+            NSString *p = sub.length ? [d stringByAppendingPathComponent:sub] : d;
+            NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:p error:nil];
+            if (!items.count) { continue; }
+            NSUInteger big = 0; NSString *bigN = nil;
+            for (NSString *f in items) {
+                NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:
+                                    [p stringByAppendingPathComponent:f] error:nil];
+                unsigned long long sz = [at fileSize];
+                if (sz > big) { big = (NSUInteger)sz; bigN = f; }
+            }
+            mlog(@"dccprobe(%s) %@ : %lu files, biggest=%@ (%lu B)",
+                 why, p, (unsigned long)items.count, bigN, (unsigned long)big);
+        }
+    }
+}
+
 static void gnm_scan_probe(void) {
     NSArray *dirs = gnm_probe_dirs();
     // 1) 探针
@@ -139,6 +161,55 @@ static void gnm_scan_probe(void) {
     }
 }
 
+#pragma mark - JS→native 日志通道：给 JSBridge 动态加 +gnmLog:
+// JS 侧 PlatformClass.createClass("JSBridge").call("gnmLog:", msg) → conch.callMethod
+//   → native Reflection → [JSBridge gnmLog:msg] → 本函数 → gnm.log
+// 这条通道不依赖文件系统，是判断 JS 层是否真的跑起来的【唯一可靠依据】。
+static void gnm_log_from_js(id self, SEL _cmd, id msg) {
+    NSString *s = nil;
+    if ([msg isKindOfClass:NSClassFromString(@"NSString")]) { s = (NSString *)msg; }
+    else if (msg) { s = [msg description]; }
+    if (s.length) { mlog(@"JSB| %@", s); }
+}
+
+static void gnm_install_js_bridge(void) {
+    Class c = NSClassFromString(@"JSBridge");
+    if (!c) { mlog(@"JSBridge NOT FOUND (js log channel off)"); return; }
+    Class meta = object_getClass(c);
+    BOOL ok = class_addMethod(meta, @selector(gnmLog:), (IMP)gnm_log_from_js, "v@:@");
+    mlog(@"JSBridge gnmLog: added=%d", ok);
+}
+
+#pragma mark - fishhook：把 JS 侧的 gnm_* 相对路径重定向到 Documents
+// LayaNative 的 fs_writeFileSync/fs_readFileSync 底层是纯 fopen，相对路径基于进程 cwd。
+// JS 侧 getCachePath() 实测返回 <home>/Library/Caches/，写成相对名就落到不可预期的位置。
+// 这里把三个固定文件名的【非绝对路径】读写一律改写到 Documents —— native 必能扫到。
+static FILE *(*orig_fopen)(const char *, const char *);
+static const char *gnm_redirect_name(const char *path) {
+    if (!path || path[0] == '/') { return NULL; }
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    if (!strcmp(base, "gnm_js.log") || !strcmp(base, "gnm_probe.txt") || !strcmp(base, "gnm_flags.json")) {
+        return base;
+    }
+    return NULL;
+}
+static FILE *my_fopen(const char *path, const char *mode) {
+    const char *base = gnm_redirect_name(path);
+    if (base) {
+        static char s_doc[512];
+        if (!s_doc[0]) { snprintf(s_doc, sizeof(s_doc), "%s/Documents", NSHomeDirectory().UTF8String); }
+        char np[768];
+        snprintf(np, sizeof(np), "%s/%s", s_doc, base);
+        return orig_fopen(np, mode);
+    }
+    return orig_fopen(path, mode);
+}
+static void gnm_install_fopen_hook(void) {
+    rebind_symbols((struct rebinding[1]){{"fopen", (void *)my_fopen, (void **)&orig_fopen}}, 1);
+    mlog(@"fopen redirect installed (gnm_* -> Documents)");
+}
+
 #pragma mark - JS 源码（由 gen.py 注入，JSON/ObjC 双重转义已校验）
 static NSString *const kBootJS =
     @"/*\n * boot.js  -- injected via [conchRuntime runJS:] (LayaAir Conch)\n * Goal: obtain js/bundle.js source, splice hook.js inside the IIFE, evaluate.\n * All strings are ASCII to avoid any encoding hazard across runJS.\n */\n(function () {\n    'use strict';\n\n    /* ---- resolve global object (runJS eval ctx may lack `window`) ---- */\n    var G = null;\n    try { if (typeof window !=="
@@ -146,31 +217,32 @@ static NSString *const kBootJS =
     @" }\n    if (G.__GNM_BOOT) { return; }\n    G.__GNM_BOOT = true;\n    G.__GNM_BOOT_V = 2;\n\n    /* ---- cache path ---- */\n    var CP = '';\n    try { if (typeof conch !== 'undefined' && conch.getCachePath) { CP = '' + conch.getCachePath(); } } catch (e) { }\n    if (!CP) { try { CP = '' + conchConfig.getCachePath(); } catch (e) { } }\n    G.__GNM_CACHE = CP;\n\n    function paths(name) "
     @"{\n        var out = [], seen = {};\n        function add(p) { if (p && !seen[p]) { seen[p] = 1; out.push(p); } }\n        if (CP) {\n            add(CP + '/' + name);\n            add(CP + '/LayaCache/appCache/' + name);\n        }\n        add(name);\n        add('/tmp/' + name);\n        add('/var/mobile/Documents/' + name);\n        return out;\n    }\n    function writeFile(name, text"
     @") {\n        var ps = paths(name), fns = [], i, j, ok = 0;\n        try { if (typeof fs_writeFileSync === 'function') { fns.push(fs_writeFileSync); } } catch (e) { }\n        try { if (typeof writeFile === 'function') { fns.push(writeFile); } } catch (e) { }\n        try { if (typeof writeFileSync === 'function') { fns.push(writeFileSync); } } catch (e) { }\n        for (i = 0; i < "
-    @"ps.length; i++) {\n            for (j = 0; j < fns.length; j++) {\n                try { fns[j](ps[i], text); ok++; break; } catch (e) { }\n            }\n        }\n        return ok;\n    }\n\n    /* ---- log ring + flush ---- */\n    var LINES = [];\n    G.__GNM_LOG = function (m) {\n        try {\n            LINES.push('[' + Date.now() + '] ' + m);\n            if (LINES.length > 500) "
-    @"{ LINES.splice(0, LINES.length - 500); }\n            writeFile('gnm_js.log', LINES.join('\\n'));\n        } catch (e) { }\n    };\n    function L(m) { try { G.__GNM_LOG('[boot] ' + m); } catch (e) { } }\n\n    /* ---- probe: report env back to native ---- */\n    function probe(extra) {\n        var s = [\n            'v=2',\n            'alive=' + (G.__GNM_ALIVE || 0),\n            'cach"
-    @"ePath=' + CP,\n            'fs_write=' + (typeof fs_writeFileSync),\n            'fs_read=' + (typeof fs_readFileSync),\n            'readFileSync=' + (typeof readFileSync),\n            'loadLib=' + (typeof G.loadLib),\n            'appcache=' + (typeof G.appcache),\n            'conch=' + (typeof conch),\n            'bundle=' + (G.__GNM_BUNDLE_LEN || 0),\n            'extra=' + (ext"
-    @"ra || '')\n        ].join('\\n');\n        writeFile('gnm_probe.txt', s);\n        return s;\n    }\n    probe('boot start');\n    try { if (typeof conch !== 'undefined' && conch.log) { conch.log('GNM boot v2 cp=' + CP); } } catch (e) { }\n\n    /* ---- read helpers ---- */\n    function toStr(buf) {\n        if (buf == null) { return null; }\n        if (typeof buf === 'string') { return "
-    @"buf; }\n        try {\n            var u8 = new Uint8Array(buf);\n            if (u8.length < 100) { return null; }\n            var out = '';\n            for (var i = 0; i < u8.length; i += 8192) {\n                out += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));\n            }\n            return out;\n        } catch (e) { return null; }\n    }\n    var CRC_T = (funct"
-    @"ion () {\n        var t = [], c, n, k;\n        for (n = 0; n < 256; n++) {\n            c = n;\n            for (k = 0; k < 8; k++) { c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }\n            t[n] = c >>> 0;\n        }\n        return t;\n    })();\n    function crc32(str) {\n        var c = 0xFFFFFFFF;\n        for (var i = 0; i < str.length; i++) { c = CRC_T[(c ^ str.charCodeA"
-    @"t(i)) & 0xFF] ^ (c >>> 8); }\n        return ((c ^ 0xFFFFFFFF) >>> 0);\n    }\n    function hex8(n) { var s = (n >>> 0).toString(16); while (s.length < 8) { s = '0' + s; } return s; }\n    function readRaw(path) {\n        var fns = [];\n        try { if (typeof fs_readFileSync === 'function') { fns.push(fs_readFileSync); } } catch (e) { }\n        try { if (typeof readFileSync === 'f"
-    @"unction') { fns.push(readFileSync); } } catch (e) { }\n        try { if (typeof readFile === 'function') { fns.push(readFile); } } catch (e) { }\n        for (var i = 0; i < fns.length; i++) {\n            for (var k = 0; k < 2; k++) {\n                try {\n                    var s = toStr(k === 0 ? fns[i](path, 'utf8') : fns[i](path));\n                    if (s) { return s; }\n  "
-    @"              } catch (e) { }\n            }\n        }\n        return null;\n    }\n    function dccRoots() {\n        var r = [], seen = {};\n        function add(p) { if (p && !seen[p]) { seen[p] = 1; r.push(p); } }\n        if (CP) {\n            add(CP + '/stand.alone.version');\n            add(CP + '/appCache/stand.alone.version');\n            add(CP + '/LayaCache/appCache/stand."
-    @"alone.version');\n            add(CP + '/../stand.alone.version');\n            add(CP);\n        }\n        add('/var/mobile/Library/Caches/LayaCache/appCache/stand.alone.version');\n        return r;\n    }\n    function READ(url) {\n        var u = '' + url;\n        var base = u.substring(u.lastIndexOf('/') + 1);\n        var cands = [u, '/' + base, base], i, s;\n\n        try {\n      "
-    @"      var ac = G.appcache;\n            if (ac && typeof ac.loadCachedURL === 'function') {\n                for (i = 0; i < cands.length; i++) {\n                    s = toStr(ac.loadCachedURL(cands[i]));\n                    if (s && s.length > 100000) { L('via appcache ' + cands[i]); return s; }\n                }\n            }\n        } catch (e) { L('appcache err ' + e); }\n\n   "
-    @"     for (i = 0; i < cands.length; i++) {\n            s = readRaw(cands[i]);\n            if (s && s.length > 100000) { L('via file ' + cands[i]); return s; }\n        }\n\n        var roots = dccRoots(), fid = hex8(crc32(u));\n        for (i = 0; i < roots.length; i++) {\n            s = readRaw(roots[i] + '/' + fid);\n            if (s && s.length > 100000 && s.indexOf('}());') > 0)"
-    @" { L('via dcc ' + roots[i] + '/' + fid); return s; }\n        }\n\n        try {\n            if (typeof fs_readdirSync === 'function') {\n                for (i = 0; i < roots.length; i++) {\n                    var list = null;\n                    try { list = fs_readdirSync(roots[i]); } catch (e) { }\n                    if (!list) { continue; }\n                    for (var j = 0; "
-    @"j < list.length; j++) {\n                        var nm = '' + list[j];\n                        if (!/^[0-9a-f]{8}$/.test(nm)) { continue; }\n                        var t = readRaw(roots[i] + '/' + nm);\n                        if (t && t.length > 100000 && t.indexOf('}());') > 0) {\n                            L('via dirscan ' + roots[i] + '/' + nm);\n                            r"
-    @"eturn t;\n                        }\n                    }\n                }\n            }\n        } catch (e) { }\n        return null;\n    }\n\n    /* ---- instrument + evaluate ---- */\n    var HOOK = G.__GNM_HOOK_SRC || '';\n    function instrument(src) {\n        if (!src || src.length < 100000) { return null; }\n        var idx = src.lastIndexOf('}());');\n        if (idx < 0) { id"
-    @"x = src.lastIndexOf('})();'); }\n        if (idx < 0) { idx = src.length; }\n        G.__GNM_BUNDLE_LEN = src.length;\n        return src.substring(0, idx) + '\\n' + HOOK + '\\n' + src.substring(idx);\n    }\n    var done = false;\n    function tryBundle(url, tag) {\n        if (done) { return true; }\n        try {\n            var src = READ(url);\n            if (!src) { L('bundle read "
-    @"FAILED (' + tag + ')'); return false; }\n            var out = instrument(src);\n            if (!out) { return false; }\n            done = true;\n            probe('instrumented len=' + src.length + ' tag=' + tag);\n            try { G.eval(out + '\\n//@ sourceURL=' + url); }\n            catch (e1) {\n                L('G.eval err ' + e1);\n                try { (0, eval)(out); } cat"
-    @"ch (e2) { L('indirect eval err ' + e2); }\n            }\n            probe('hook evaluated alive=' + (G.__GNM_ALIVE || 0));\n            return true;\n        } catch (e) { L('tryBundle err ' + e); return false; }\n    }\n\n    /* ---- three interception paths ---- */\n    function wrapLoadLib() {\n        if (G.__GNM_LIBW) { return true; }\n        var f = G.loadLib;\n        if (typeof"
-    @" f !== 'function') { return false; }\n        G.__GNM_LIBW = true;\n        G.loadLib = function (url) {\n            try {\n                if (url && ('' + url).indexOf('bundle.js') >= 0 && tryBundle(url, 'loadLib')) { return; }\n            } catch (e) { L('loadLib wrap err ' + e); }\n            return f.apply(this, arguments);\n        };\n        L('loadLib wrapped');\n        ret"
-    @"urn true;\n    }\n    function wrapEval() {\n        if (G.__GNM_EVALW) { return true; }\n        var f = G.eval;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_EVALW = true;\n        G.eval = function (code) {\n            try {\n                if (!done && typeof code === 'string' && code.length > 100000 &&\n                    code.indexOf('}());') > 0 && co"
-    @"de.indexOf('__GNM_HOOK_INSTALLED') < 0) {\n                    var out = instrument(code);\n                    if (out) { done = true; probe('instrumented len=' + code.length + ' tag=eval'); return f.call(G, out); }\n                }\n            } catch (e) { L('eval wrap err ' + e); }\n            return f.apply(this, arguments);\n        };\n        L('eval wrapped');\n        ret"
-    @"urn true;\n    }\n    function wrapRequire() {\n        if (G.__GNM_REQW) { return true; }\n        var f = G.require;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_REQW = true;\n        G.require = function (n) {\n            try {\n                if (n && ('' + n).indexOf('bundle.js') >= 0 && tryBundle(n, 'require')) { return; }\n            } catch (e) { }\n"
-    @"            return f.apply(this, arguments);\n        };\n        L('require wrapped');\n        return true;\n    }\n\n    L('wraps loadLib=' + wrapLoadLib() + ' eval=' + wrapEval() + ' require=' + wrapRequire());\n\n    /* ---- retry / fallback ---- */\n    var n = 0;\n    var t = setInterval(function () {\n        n++;\n        if (done) { probe('done'); clearInterval(t); return; }\n    "
-    @"    wrapLoadLib(); wrapEval(); wrapRequire();\n        if (n === 25) { tryBundle('js/bundle.js', 'poll'); }\n        if (n === 60) { tryBundle('/js/bundle.js', 'poll2'); tryBundle('index.js', 'poll3'); }\n        if (n === 120) { probe('giveup loadLib=' + (typeof G.loadLib)); clearInterval(t); }\n    }, 200);\n\n    setInterval(function () { probe(G.__GNM_ALIVE ? 'alive' : 'waiting')"
-    @"; }, 5000);\n\n    L('boot v2 ready hookLen=' + HOOK.length);\n})();\n";
+    @"ps.length; i++) {\n            for (j = 0; j < fns.length; j++) {\n                try { fns[j](ps[i], text); ok++; break; } catch (e) { }\n            }\n        }\n        return ok;\n    }\n\n    /* ---- JS -> native channel (no filesystem needed) ---- */\n    var bridge = null, bridgeOK = 0;\n    function toNative(msg) {\n        if (bridgeOK === -1) { return; }\n        try {\n        "
+    @"    if (!bridge) {\n                if (typeof PlatformClass === 'undefined') { bridgeOK = -1; return; }\n                bridge = PlatformClass.createClass('JSBridge');\n            }\n            if (!bridge || typeof bridge.call !== 'function') { bridgeOK = -1; return; }\n            bridge.call('gnmLog:', '' + msg);\n            bridgeOK = 1;\n        } catch (e) { bridgeOK = -1; "
+    @"}\n    }\n\n    /* ---- log ring + flush ---- */\n    var LINES = [];\n    G.__GNM_LOG = function (m) {\n        try {\n            LINES.push('[' + Date.now() + '] ' + m);\n            if (LINES.length > 500) { LINES.splice(0, LINES.length - 500); }\n            writeFile('gnm_js.log', LINES.join('\\n'));\n            toNative(m);\n        } catch (e) { }\n    };\n    function L(m) { try { "
+    @"G.__GNM_LOG('[boot] ' + m); } catch (e) { } }\n\n    /* ---- probe: report env back to native ---- */\n    function probe(extra) {\n        var s = [\n            'v=2',\n            'alive=' + (G.__GNM_ALIVE || 0),\n            'cachePath=' + CP,\n            'fs_write=' + (typeof fs_writeFileSync),\n            'fs_read=' + (typeof fs_readFileSync),\n            'readFileSync=' + (type"
+    @"of readFileSync),\n            'loadLib=' + (typeof G.loadLib),\n            'appcache=' + (typeof G.appcache),\n            'conch=' + (typeof conch),\n            'bundle=' + (G.__GNM_BUNDLE_LEN || 0),\n            'extra=' + (extra || '')\n        ].join('\\n');\n        writeFile('gnm_probe.txt', s);\n        return s;\n    }\n    probe('boot start');\n    L('BRIDGE-PROOF');   /* first"
+    @" line: proves runJS really executed */\n    try { if (typeof conch !== 'undefined' && conch.log) { conch.log('GNM boot v2 cp=' + CP); } } catch (e) { }\n\n    /* ---- read helpers ---- */\n    function toStr(buf) {\n        if (buf == null) { return null; }\n        if (typeof buf === 'string') { return buf; }\n        try {\n            var u8 = new Uint8Array(buf);\n            if (u8"
+    @".length < 100) { return null; }\n            var out = '';\n            for (var i = 0; i < u8.length; i += 8192) {\n                out += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));\n            }\n            return out;\n        } catch (e) { return null; }\n    }\n    var CRC_T = (function () {\n        var t = [], c, n, k;\n        for (n = 0; n < 256; n++) {\n       "
+    @"     c = n;\n            for (k = 0; k < 8; k++) { c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }\n            t[n] = c >>> 0;\n        }\n        return t;\n    })();\n    function crc32(str) {\n        var c = 0xFFFFFFFF;\n        for (var i = 0; i < str.length; i++) { c = CRC_T[(c ^ str.charCodeAt(i)) & 0xFF] ^ (c >>> 8); }\n        return ((c ^ 0xFFFFFFFF) >>> 0);\n    }\n    f"
+    @"unction hex8(n) { var s = (n >>> 0).toString(16); while (s.length < 8) { s = '0' + s; } return s; }\n    function readRaw(path) {\n        var fns = [];\n        try { if (typeof fs_readFileSync === 'function') { fns.push(fs_readFileSync); } } catch (e) { }\n        try { if (typeof readFileSync === 'function') { fns.push(readFileSync); } } catch (e) { }\n        try { if (typeof re"
+    @"adFile === 'function') { fns.push(readFile); } } catch (e) { }\n        for (var i = 0; i < fns.length; i++) {\n            for (var k = 0; k < 2; k++) {\n                try {\n                    var s = toStr(k === 0 ? fns[i](path, 'utf8') : fns[i](path));\n                    if (s) { return s; }\n                } catch (e) { }\n            }\n        }\n        return null;\n    }\n"
+    @"    function dccRoots() {\n        var r = [], seen = {};\n        function add(p) { if (p && !seen[p]) { seen[p] = 1; r.push(p); } }\n        if (CP) {\n            add(CP + '/stand.alone.version');\n            add(CP + '/appCache/stand.alone.version');\n            add(CP + '/LayaCache/appCache/stand.alone.version');\n            add(CP + '/../stand.alone.version');\n            add"
+    @"(CP);\n        }\n        add('/var/mobile/Library/Caches/LayaCache/appCache/stand.alone.version');\n        return r;\n    }\n    function READ(url) {\n        var u = '' + url;\n        var base = u.substring(u.lastIndexOf('/') + 1);\n        var cands = [u, '/' + base, base], i, s;\n\n        try {\n            var ac = G.appcache;\n            if (ac && typeof ac.loadCachedURL === 'fun"
+    @"ction') {\n                for (i = 0; i < cands.length; i++) {\n                    s = toStr(ac.loadCachedURL(cands[i]));\n                    if (s && s.length > 100000) { L('via appcache ' + cands[i]); return s; }\n                }\n            }\n        } catch (e) { L('appcache err ' + e); }\n\n        for (i = 0; i < cands.length; i++) {\n            s = readRaw(cands[i]);\n    "
+    @"        if (s && s.length > 100000) { L('via file ' + cands[i]); return s; }\n        }\n\n        var roots = dccRoots(), fid = hex8(crc32(u));\n        for (i = 0; i < roots.length; i++) {\n            s = readRaw(roots[i] + '/' + fid);\n            if (s && s.length > 100000 && s.indexOf('}());') > 0) { L('via dcc ' + roots[i] + '/' + fid); return s; }\n        }\n\n        try {\n   "
+    @"         if (typeof fs_readdirSync === 'function') {\n                for (i = 0; i < roots.length; i++) {\n                    var list = null;\n                    try { list = fs_readdirSync(roots[i]); } catch (e) { }\n                    if (!list) { continue; }\n                    for (var j = 0; j < list.length; j++) {\n                        var nm = '' + list[j];\n          "
+    @"              if (!/^[0-9a-f]{8}$/.test(nm)) { continue; }\n                        var t = readRaw(roots[i] + '/' + nm);\n                        if (t && t.length > 100000 && t.indexOf('}());') > 0) {\n                            L('via dirscan ' + roots[i] + '/' + nm);\n                            return t;\n                        }\n                    }\n                }\n      "
+    @"      }\n        } catch (e) { }\n        return null;\n    }\n\n    /* ---- instrument + evaluate ---- */\n    var HOOK = G.__GNM_HOOK_SRC || '';\n    function instrument(src) {\n        if (!src || src.length < 100000) { return null; }\n        var idx = src.lastIndexOf('}());');\n        if (idx < 0) { idx = src.lastIndexOf('})();'); }\n        if (idx < 0) { idx = src.length; }\n      "
+    @"  G.__GNM_BUNDLE_LEN = src.length;\n        return src.substring(0, idx) + '\\n' + HOOK + '\\n' + src.substring(idx);\n    }\n    var done = false;\n    function tryBundle(url, tag) {\n        if (done) { return true; }\n        try {\n            var src = READ(url);\n            if (!src) { L('bundle read FAILED (' + tag + ')'); return false; }\n            var out = instrument(src);\n  "
+    @"          if (!out) { return false; }\n            done = true;\n            probe('instrumented len=' + src.length + ' tag=' + tag);\n            try { G.eval(out + '\\n//@ sourceURL=' + url); }\n            catch (e1) {\n                L('G.eval err ' + e1);\n                try { (0, eval)(out); } catch (e2) { L('indirect eval err ' + e2); }\n            }\n            probe('hook e"
+    @"valuated alive=' + (G.__GNM_ALIVE || 0));\n            return true;\n        } catch (e) { L('tryBundle err ' + e); return false; }\n    }\n\n    /* ---- three interception paths ---- */\n    function wrapLoadLib() {\n        if (G.__GNM_LIBW) { return true; }\n        var f = G.loadLib;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_LIBW = true;\n        G.loadL"
+    @"ib = function (url) {\n            try {\n                if (url && ('' + url).indexOf('bundle.js') >= 0 && tryBundle(url, 'loadLib')) { return; }\n            } catch (e) { L('loadLib wrap err ' + e); }\n            return f.apply(this, arguments);\n        };\n        L('loadLib wrapped');\n        return true;\n    }\n    function wrapEval() {\n        if (G.__GNM_EVALW) { return tru"
+    @"e; }\n        var f = G.eval;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_EVALW = true;\n        G.eval = function (code) {\n            try {\n                if (!done && typeof code === 'string' && code.length > 100000 &&\n                    code.indexOf('}());') > 0 && code.indexOf('__GNM_HOOK_INSTALLED') < 0) {\n                    var out = instrumen"
+    @"t(code);\n                    if (out) { done = true; probe('instrumented len=' + code.length + ' tag=eval'); return f.call(G, out); }\n                }\n            } catch (e) { L('eval wrap err ' + e); }\n            return f.apply(this, arguments);\n        };\n        L('eval wrapped');\n        return true;\n    }\n    function wrapRequire() {\n        if (G.__GNM_REQW) { return t"
+    @"rue; }\n        var f = G.require;\n        if (typeof f !== 'function') { return false; }\n        G.__GNM_REQW = true;\n        G.require = function (n) {\n            try {\n                if (n && ('' + n).indexOf('bundle.js') >= 0 && tryBundle(n, 'require')) { return; }\n            } catch (e) { }\n            return f.apply(this, arguments);\n        };\n        L('require wrappe"
+    @"d');\n        return true;\n    }\n\n    L('wraps loadLib=' + wrapLoadLib() + ' eval=' + wrapEval() + ' require=' + wrapRequire());\n\n    /* ---- retry / fallback ---- */\n    var n = 0;\n    var t = setInterval(function () {\n        n++;\n        if (done) { probe('done'); clearInterval(t); return; }\n        wrapLoadLib(); wrapEval(); wrapRequire();\n        if (n === 25) { tryBundle('"
+    @"js/bundle.js', 'poll'); }\n        if (n === 60) { tryBundle('/js/bundle.js', 'poll2'); tryBundle('index.js', 'poll3'); }\n        if (n === 120) { probe('giveup loadLib=' + (typeof G.loadLib)); clearInterval(t); }\n    }, 200);\n\n    setInterval(function () { probe(G.__GNM_ALIVE ? 'alive' : 'waiting'); }, 5000);\n\n    L('boot v2 ready hookLen=' + HOOK.length);\n})();\n";
 static NSString *const kHookJSON =
     @"window.__GNM_HOOK_SRC = \"/*\\n * hook.js -- spliced into js/bundle.js IIFE (evaluated in global scope by boot.js)\\n * Available: SceneMgr / PropMgr / MainRoleMgr / Role / iOSDeal / SDK / SDK_ORDER / Laya\\n * Switch: G.__GNM_CFG pushed by native via [conchRuntime runJS:]\\n *\\n * Features:\\n *   1) ad skip  2) see-through (depthTest=ALWAYS)  3) draw enemies on screen  4) bright\\n "
     @"* ASCII-only on purpose: runJS must not carry non-ASCII bytes.\\n */\\n(function () {\\n    'use strict';\\n    var G = null;\\n    try { if (typeof window !== 'undefined' && window) { G = window; } } catch (e) { }\\n    if (!G) { try { G = globalThis; } catch (e) { } }\\n    if (!G) { G = this; }\\n    var CFG = G.__GNM_CFG = G.__GNM_CFG || { esp: 0, bright: 0, ad: 1 };\\n    function "
@@ -271,7 +343,8 @@ static void gnm_on_frame(id rt) {
     // 探针/JS 日志：只在注入后前 30s 高频轮询，之后降频
     if (g_injected && (g_frame < 1800 ? (g_frame % 60 == 0) : (g_frame % 600 == 0))) {
         gnm_scan_probe();
-        // 真·未跑起来才重注入（探针完全没出现 ≠ JS 没执行，需两者都缺）
+        if (g_frame == 120) { gnm_probe_dcc("t120"); }
+        // 真·未跑起来才重注入
         if (!g_probeSeen && g_frame < 1200 && g_frame % 300 == 0) {
             mlog(@"probe still missing -> re-inject at tick %d", g_frame);
             gnm_inject(rt, "retry");
@@ -544,7 +617,9 @@ static void gnm_ensure_overlay(void) {
 #pragma mark - ctor
 __attribute__((constructor))
 static void gnm_ctor(void) {
-    mlog(@"ctor: GNMTweak v1 (pid=%d)", getpid());
+    mlog(@"ctor: GNMTweak v2 (pid=%d)", getpid());
+    gnm_install_js_bridge();
+    gnm_install_fopen_hook();     // 必须在任何 JS 写文件之前
     gnm_install_frame_hooks();
     gnm_install_ad_hooks();
     gnm_sync_flags();
