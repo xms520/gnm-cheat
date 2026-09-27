@@ -301,7 +301,7 @@ static void gnm_refresh_buttons(void) {
         title.font = [UIFont boldSystemFontOfSize:15];
         [self addSubview:title];
 
-        UILabel *sub = [UILabel alloc] initWithFrame:CGRectMake(62, 35, 170, 16)];
+        UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(62, 35, 170, 16)];
         sub.text = @"恐怖奶奶迷雾 · 助手";
         sub.textColor = [UIColor colorWithWhite:1 alpha:0.45];
         sub.font = [UIFont systemFontOfSize:10];
