@@ -30,7 +30,8 @@ jobs:
             -O2 \
             -Wall \
             -o GNMTweak.dylib \
-            GNMTweak.m
+            GNMTweak.m \
+            fishhook.c
           file GNMTweak.dylib
           ls -la GNMTweak.dylib
           xcrun -sdk iphoneos nm -u GNMTweak.dylib | head -60
