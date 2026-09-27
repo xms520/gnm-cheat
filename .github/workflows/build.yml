@@ -1,0 +1,49 @@
+name: build-gnm-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'GNMTweak.m'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build GNMTweak.dylib (arm64, no theos)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -Wall \
+            -o GNMTweak.dylib \
+            GNMTweak.m
+          file GNMTweak.dylib
+          ls -la GNMTweak.dylib
+          xcrun -sdk iphoneos nm -u GNMTweak.dylib | head -60
+
+      - name: Verify arm64 mach-o
+        run: |
+          vtool -show-build GNMTweak.dylib || true
+          md5 GNMTweak.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GNMTweak.dylib
+          path: |
+            GNMTweak.dylib
+            GNMTweak.m
+            control
