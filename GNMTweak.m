@@ -180,6 +180,9 @@ static void gnm_install_js_bridge(void) {
     mlog(@"JSBridge gnmLog: added=%d", ok);
 }
 
+static void gnm_run_js(id rt, NSString *js);
+static void gnm_probe_dcc(const char *why);
+
 #pragma mark - JS 源码（由 gen.py 注入，JSON/ObjC 双重转义已校验）
 static NSString *const kBootJS =
     @"/*\n * boot.js  -- injected via [conchRuntime runJS:] (LayaAir Conch)\n * Goal: obtain js/bundle.js source, splice hook.js inside the IIFE, evaluate.\n * All strings are ASCII to avoid any encoding hazard across runJS.\n */\n(function () {\n    'use strict';\n\n    /* ---- resolve global object (runJS eval ctx may lack `window`) ---- */\n    var G = null;\n    try { if (typeof window !=="
@@ -429,8 +432,6 @@ static void (*orig_onVsync)(id, SEL, id);
 static void (*orig_onGLReady)(id, SEL, int, int, int);
 static void gnm_on_frame(id self);
 static void gnm_inject(id rt, const char *why);
-static void gnm_run_js(id rt, NSString *js);
-static void gnm_probe_dcc(const char *why);
 
 static void hook_renderFrame(id s, SEL c) { if (orig_renderFrame) { orig_renderFrame(s, c); } gnm_on_frame(s); }
 static void hook_runJsLoop(id s, SEL c)   { if (orig_runJsLoop)   { orig_runJsLoop(s, c);   } gnm_on_frame(s); }
